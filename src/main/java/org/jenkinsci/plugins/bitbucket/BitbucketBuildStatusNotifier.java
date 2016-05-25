@@ -15,10 +15,13 @@ import hudson.model.AbstractProject;
 import hudson.model.BuildListener;
 import hudson.model.Item;
 import hudson.model.Job;
+import hudson.model.ListView.Listener;
 import hudson.model.Result;
+import hudson.model.TaskListener;
 import hudson.plugins.git.GitSCM;
 import hudson.plugins.git.util.BuildData;
 import hudson.plugins.mercurial.MercurialSCM;
+import hudson.plugins.mercurial.MercurialTagAction;
 import hudson.scm.SCM;
 import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.BuildStepMonitor;
@@ -28,6 +31,7 @@ import hudson.tasks.test.AbstractTestResultAction;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 import hudson.util.LogTaskListener;
+
 import java.util.Iterator;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -35,6 +39,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
 import jenkins.model.Jenkins;
 import net.sf.json.JSONObject;
 import org.apache.commons.codec.digest.DigestUtils;
@@ -89,9 +94,9 @@ public class BitbucketBuildStatusNotifier extends Notifier {
             return true;
         }
         logger.info("Bitbucket notify on start");
-
+        
         try {
-            this.notifyBuildStatus(build, listener);
+            this.notifyBuildStatus(build, listener,  new Launcher.LocalLauncher(listener));
         } catch (Exception e) {
             logger.log(Level.INFO, "Bitbucket notify on start failed: " + e.getMessage(), e);
             listener.getLogger().println("Bitbucket notify on start failed: " + e.getMessage());
@@ -112,7 +117,7 @@ public class BitbucketBuildStatusNotifier extends Notifier {
         logger.info("Bitbucket notify on finish");
 
         try {
-            this.notifyBuildStatus(build, listener);
+            this.notifyBuildStatus(build, listener, launcher);
         } catch (Exception e) {
             logger.log(Level.INFO, "Bitbucket notify on finish failed: " + e.getMessage(), e);
             listener.getLogger().println("Bitbucket notify on finish failed: " + e.getMessage());
@@ -172,19 +177,18 @@ public class BitbucketBuildStatusNotifier extends Notifier {
         return state;
     }
 
-    private List<BitbucketBuildStatusResource> createBuildStatusResources(final AbstractBuild build) throws Exception {
+    private List<BitbucketBuildStatusResource> createBuildStatusResources(final AbstractBuild build, Launcher launcher, TaskListener listener) throws Exception {
         SCM scm = build.getProject().getScm();
         if (scm == null) {
             throw new Exception("Bitbucket build notifier only works with SCM");
         }
-
         ScmAdapter scmAdapter;
         if (scm instanceof GitSCM) {
             scmAdapter = new GitScmAdapter((GitSCM) scm, build);
         } else if (scm instanceof MercurialSCM) {
-            scmAdapter = new MercurialScmAdapter((MercurialSCM) scm);
+            scmAdapter = new MercurialScmAdapter((MercurialSCM) scm, build, launcher, listener);
         } else if (scm instanceof MultiSCM){
-            scmAdapter = new MultiScmAdapter(build);
+            scmAdapter = new MultiScmAdapter(build, launcher, listener);
         } else {
             throw new Exception("Bitbucket build notifier requires a git repo or a mercurial repo as SCM");
         }
@@ -235,15 +239,15 @@ public class BitbucketBuildStatusNotifier extends Notifier {
         return buildStatusResources;
     }
 
-    private void notifyBuildStatus(final AbstractBuild build, final BuildListener listener) throws Exception {
+    private void notifyBuildStatus(final AbstractBuild build, final BuildListener listener, Launcher launcher) throws Exception {
 
         UsernamePasswordCredentials credentials = BitbucketBuildStatusNotifier.getCredentials(this.getCredentialsId(), build.getProject());
-        List<BitbucketBuildStatusResource> buildStatusResources = this.createBuildStatusResources(build);
+        List<BitbucketBuildStatusResource> buildStatusResources = this.createBuildStatusResources(build,launcher, listener );
 
         AbstractBuild prevBuild = build.getPreviousBuild();
         List<BitbucketBuildStatusResource> prevBuildStatusResources = new ArrayList<BitbucketBuildStatusResource>();
         if (prevBuild != null && prevBuild.getResult() != null && prevBuild.getResult() == Result.ABORTED) {
-            prevBuildStatusResources = this.createBuildStatusResources(prevBuild);
+            prevBuildStatusResources = this.createBuildStatusResources(prevBuild, launcher,listener);
         }
 
         for (Iterator<BitbucketBuildStatusResource> i = buildStatusResources.iterator(); i.hasNext(); ) {
@@ -346,9 +350,15 @@ public class BitbucketBuildStatusNotifier extends Notifier {
     private class MercurialScmAdapter implements ScmAdapter {
 
         private final MercurialSCM hgSCM;
+        private final AbstractBuild build;
+        private final Launcher launcher;
+        private final TaskListener listener;
 
-        public MercurialScmAdapter(MercurialSCM scm) {
+        public MercurialScmAdapter(MercurialSCM scm, AbstractBuild build, Launcher launcher, TaskListener listener) {
             this.hgSCM = scm;
+            this.build = build;
+            this.launcher = launcher;
+            this.listener = listener;
         }
 
         public Map getCommitRepoMap() throws Exception {
@@ -356,9 +366,10 @@ public class BitbucketBuildStatusNotifier extends Notifier {
             if (source == null || source.isEmpty()) {
                 throw new Exception("None or multiple repos");
             }
-
+            MercurialTagAction mta =(MercurialTagAction)hgSCM.calcRevisionsFromBuild(build, build.getWorkspace(),this.launcher, this.listener);
+            
             HashMap<String, URIish> commitRepoMap = new HashMap();
-            commitRepoMap.put(this.hgSCM.getRevision(), new URIish(this.hgSCM.getSource()));
+            commitRepoMap.put(mta.id, new URIish(this.hgSCM.getSource()));
 
             return commitRepoMap;
         }
@@ -367,9 +378,13 @@ public class BitbucketBuildStatusNotifier extends Notifier {
     private class MultiScmAdapter implements ScmAdapter {
 
         private final AbstractBuild build;
+           private final Launcher launcher;
+        private final TaskListener listener;
 
-        public MultiScmAdapter(AbstractBuild build) {
+        public MultiScmAdapter(AbstractBuild build, Launcher launcher, TaskListener listener) {
             this.build = build;
+            this.launcher = launcher;
+            this.listener = listener;
         }
 
         public Map getCommitRepoMap() throws Exception {
@@ -382,7 +397,7 @@ public class BitbucketBuildStatusNotifier extends Notifier {
                 if (scm instanceof GitSCM) {
                     commitRepoMap.putAll(new GitScmAdapter((GitSCM) scm, this.build).getCommitRepoMap());
                 } else if (scm instanceof MercurialSCM) {
-                    commitRepoMap.putAll(new MercurialScmAdapter((MercurialSCM) scm).getCommitRepoMap());
+                    commitRepoMap.putAll(new MercurialScmAdapter((MercurialSCM) scm,build,launcher,listener).getCommitRepoMap());
                 }
             }
 
